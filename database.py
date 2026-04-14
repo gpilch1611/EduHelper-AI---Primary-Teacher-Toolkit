@@ -121,11 +121,28 @@ def add_book(title: str, subject: str, year_group: str,
 
 
 def get_all_books() -> list[dict]:
+    """Return all books with a chapter_count field included."""
     with _get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM books ORDER BY added_at DESC"
+            """SELECT b.*,
+                      (SELECT COUNT(*) FROM chapters c WHERE c.book_id = b.id)
+                          AS chapter_count
+               FROM books b
+               ORDER BY b.added_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_book_with_chapter_count(book_id: int) -> dict | None:
+    with _get_connection() as conn:
+        row = conn.execute(
+            """SELECT b.*,
+                      (SELECT COUNT(*) FROM chapters c WHERE c.book_id = b.id)
+                          AS chapter_count
+               FROM books b WHERE b.id = ?""",
+            (book_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def get_book(book_id: int) -> dict | None:

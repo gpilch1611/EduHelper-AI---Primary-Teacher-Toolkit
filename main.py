@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # main.py – EduHelper AI · Primary Teacher Toolkit
-# Entry point: builds the main window, wires up all components.
 
 from __future__ import annotations
 
 import os
 import threading
-import tkinter as tk
 from tkinter import messagebox
 import customtkinter as ctk
 
@@ -22,8 +20,6 @@ from ui.HomeFrame             import HomeFrame
 from ui.ImportProgressDialog  import ImportProgressDialog
 from ui.BookDashboardFrame    import BookDashboardFrame
 
-
-# Appearance must be set before any CTk widgets are created
 ctk.set_appearance_mode(DEFAULT_APPEARANCE)
 ctk.set_default_color_theme(DEFAULT_COLOR_THEME)
 
@@ -33,14 +29,15 @@ class App(ctk.CTk):
 
     def __init__(self) -> None:
         super().__init__()
-
         self.title(APP_NAME)
         self.geometry(WINDOW_DEFAULT)
         self.minsize(WINDOW_MIN_W, WINDOW_MIN_H)
 
         db.initialise_db()
 
-        self._book_tabs: dict[int, str] = {}   # book_id → tab label
+        # book_id → tab label string
+        self._book_tabs: dict[int, str] = {}
+
         self._setup_layout()
         self._load_saved_books()
         self._ping_groq_async()
@@ -69,15 +66,17 @@ class App(ctk.CTk):
         self._home_frame.grid(row=0, column=0, sticky="nsew")
 
         self._tabview = ctk.CTkTabview(self._main, anchor="nw")
-        # gridded only after first book is opened
+        # Bind tab-change to update sidebar highlight
+        self._tabview.configure(command=self._on_tab_changed)
 
         self._build_statusbar()
 
     # ── Status bar ────────────────────────────────────────────────────────────
 
     def _build_statusbar(self) -> None:
-        bar = ctk.CTkFrame(self, height=26, corner_radius=0,
-                           fg_color=("gray85", "gray15"))
+        bar = ctk.CTkFrame(
+            self, height=26, corner_radius=0, fg_color=("gray85", "gray15")
+        )
         bar.grid(row=1, column=0, columnspan=2, sticky="ew")
         bar.grid_propagate(False)
         bar.columnconfigure(1, weight=1)
@@ -107,7 +106,7 @@ class App(ctk.CTk):
         if colour:
             self._status_dot.configure(text_color=colour)
 
-    # ── Groq connectivity ping ────────────────────────────────────────────────
+    # ── Groq ping ─────────────────────────────────────────────────────────────
 
     def _ping_groq_async(self) -> None:
         def _worker():
@@ -117,37 +116,44 @@ class App(ctk.CTk):
                     f"Connected to Groq  •  {GROQ_MODEL}", "#22C55E"))
             else:
                 self.after(0, lambda: self._set_status(
-                    "Could not reach Groq API – check your network connection",
+                    "Could not reach Groq – check your network connection",
                     "#EF4444"))
-
         threading.Thread(target=_worker, daemon=True).start()
 
-    # ── Home / tab visibility ─────────────────────────────────────────────────
+    # ── Visibility helpers ────────────────────────────────────────────────────
 
     def _show_home(self) -> None:
         self._tabview.grid_remove()
         self._home_frame.grid(row=0, column=0, sticky="nsew")
+        self._sidebar.set_active_book(None)
 
     def _show_tabs(self) -> None:
         self._home_frame.grid_remove()
         self._tabview.grid(row=0, column=0, padx=0, pady=0, sticky="nsew")
 
-    # ── Import book ───────────────────────────────────────────────────────────
+    # ── Tab-change → sidebar highlight ───────────────────────────────────────
+
+    def _on_tab_changed(self) -> None:
+        try:
+            current_label = self._tabview.get()
+        except Exception:
+            return
+        # Find which book_id maps to the current tab label
+        active_id = next(
+            (bid for bid, lbl in self._book_tabs.items() if lbl == current_label),
+            None,
+        )
+        self._sidebar.set_active_book(active_id)
+
+    # ── Import ────────────────────────────────────────────────────────────────
 
     def _on_import_book(self, file_path: str) -> None:
-        """
-        Called by SidebarFrame when the user picks a PDF.
-        Opens the ImportProgressDialog which handles the full pipeline
-        (PyMuPDF extraction → Groq analysis → SQLite save) with live progress.
-        """
         if db.book_exists(file_path):
             messagebox.showinfo(
                 "Already in library",
                 f'"{os.path.basename(file_path)}" is already in your library.',
             )
             return
-
-        # Open modal progress dialog – fires _on_book_imported when done
         ImportProgressDialog(
             self,
             file_path=file_path,
@@ -155,14 +161,17 @@ class App(ctk.CTk):
         )
 
     def _on_book_imported(self, book_id: int, analysis: dict) -> None:
-        """
-        Callback fired by ImportProgressDialog immediately on successful import.
-        Updates sidebar and opens the book's dashboard tab.
-        """
-        book = db.get_book(book_id)
+        """Fired by ImportProgressDialog immediately on success."""
+        book = db.get_book_with_chapter_count(book_id)
         if not book:
             return
-        self._sidebar.add_book_button(book_id, book["title"], book["subject"])
+        self._sidebar.add_book_button(
+            book_id=book_id,
+            title=book["title"],
+            subject=book["subject"],
+            chapter_count=book.get("chapter_count", 0),
+            added_at=book.get("added_at", ""),
+        )
         self._open_book_tab(book_id, book["title"])
 
     # ── Book tab management ───────────────────────────────────────────────────
@@ -171,16 +180,15 @@ class App(ctk.CTk):
         if book_id in self._book_tabs:
             self._show_tabs()
             self._tabview.set(self._book_tabs[book_id])
+            self._sidebar.set_active_book(book_id)
         else:
             book = db.get_book(book_id)
             if book:
                 self._open_book_tab(book_id, book["title"])
 
     def _open_book_tab(self, book_id: int, title: str) -> None:
-        # Shorten long titles for the tab label
         label = title if len(title) <= 24 else title[:22] + "…"
-
-        # Ensure uniqueness if two books share a truncated label
+        # Guarantee uniqueness
         existing = list(self._book_tabs.values())
         if label in existing:
             label = f"{label[:18]}…{book_id}"
@@ -197,6 +205,7 @@ class App(ctk.CTk):
 
         self._show_tabs()
         self._tabview.set(label)
+        self._sidebar.set_active_book(book_id)
 
     def _on_delete_book(self, book_id: int) -> None:
         if book_id in self._book_tabs:
@@ -208,11 +217,12 @@ class App(ctk.CTk):
 
         db.delete_book(book_id)
         self._sidebar.refresh_books(db.get_all_books())
+        self._sidebar.set_active_book(None)
 
         if not self._book_tabs:
             self._show_home()
 
-    # ── Startup: reload persisted books into sidebar ──────────────────────────
+    # ── Startup ───────────────────────────────────────────────────────────────
 
     def _load_saved_books(self) -> None:
         self._sidebar.refresh_books(db.get_all_books())
@@ -221,8 +231,7 @@ class App(ctk.CTk):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    app = App()
-    app.mainloop()
+    App().mainloop()
 
 
 if __name__ == "__main__":
