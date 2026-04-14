@@ -28,6 +28,7 @@ from database import (
 from groq_client import groq
 import generators.lesson_plan  as lp_gen
 import generators.worksheet    as ws_gen
+# LessonPlanDialog imported lazily inside _tool_clicked to avoid circular issues
 import generators.quiz         as quiz_gen
 import generators.explanation  as exp_gen
 
@@ -596,7 +597,17 @@ class BookDashboardFrame(ctk.CTkFrame):
 
         key = tool["key"]
 
-        # Build chapter context string for the prompt
+        # ── Lesson Plan → dedicated dialog ────────────────────────────────────
+        if key == "lesson_plan":
+            from ui.LessonPlanGenerator import LessonPlanDialog
+            LessonPlanDialog(
+                self.winfo_toplevel(),
+                book=self._book,
+                chapters=self._chapters,
+            )
+            return
+
+        # Build chapter context string for the other tools
         ch_context = ""
         if self._selected_ch_id:
             ch = next(
@@ -604,24 +615,17 @@ class BookDashboardFrame(ctk.CTkFrame):
                 None,
             )
             if ch:
-                parts = [
-                    f"Chapter {ch['number']}: {ch['title']}",
-                ]
+                parts = [f"Chapter {ch['number']}: {ch['title']}"]
                 if ch.get("learning_objectives"):
-                    parts.append(
-                        "Objectives:\n" + ch["learning_objectives"]
-                    )
+                    parts.append("Objectives:\n" + ch["learning_objectives"])
                 if ch.get("key_vocabulary"):
-                    parts.append(
-                        "Key vocabulary: " + ch["key_vocabulary"]
-                    )
+                    parts.append("Key vocabulary: " + ch["key_vocabulary"])
                 if ch.get("topics"):
                     parts.append("Topics: " + ch["topics"])
                 ch_context = "\n".join(parts)
 
         year = self._book.get("year_group", "Year 3")
 
-        # Build topic string
         if self._selected_ch_id:
             ch = next(
                 (c for c in self._chapters if c["id"] == self._selected_ch_id),
@@ -633,17 +637,6 @@ class BookDashboardFrame(ctk.CTkFrame):
 
         # Map key → (prompt_builder, system, save_fn | None, display_label)
         dispatch = {
-            "lesson_plan": (
-                lambda: lp_gen.build_prompt(topic, year, "60 minutes", ch_context),
-                lp_gen.SYSTEM_PROMPT,
-                lambda content: save_lesson_plan(
-                    title=f"{topic} – {year}",
-                    content=content,
-                    book_id=self._book_id,
-                    year_group=year,
-                ),
-                "Lesson Plan",
-            ),
             "worksheet": (
                 lambda: ws_gen.build_prompt(topic, year, "Mixed", 10, ch_context),
                 ws_gen.SYSTEM_PROMPT,
