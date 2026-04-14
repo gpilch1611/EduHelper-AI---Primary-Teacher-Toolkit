@@ -1,7 +1,6 @@
 # database.py – SQLite persistence layer
 
 import sqlite3
-import os
 from datetime import datetime
 from config import DB_NAME
 
@@ -15,7 +14,7 @@ def _get_connection() -> sqlite3.Connection:
 
 
 def initialise_db() -> None:
-    """Create all tables on first run (idempotent)."""
+    """Create all tables (idempotent) then run column migrations."""
     with _get_connection() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS books (
@@ -30,12 +29,26 @@ def initialise_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS chapters (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id             INTEGER NOT NULL
+                                        REFERENCES books(id) ON DELETE CASCADE,
+                number              INTEGER NOT NULL,
+                title               TEXT    NOT NULL,
+                start_page          INTEGER,
+                end_page            INTEGER,
+                learning_objectives TEXT,
+                exercise_types      TEXT,
+                key_vocabulary      TEXT,
+                topics              TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS pages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-                number      INTEGER NOT NULL,
-                title       TEXT    NOT NULL,
-                start_page  INTEGER,
-                end_page    INTEGER
+                book_id     INTEGER NOT NULL
+                                REFERENCES books(id) ON DELETE CASCADE,
+                page_number INTEGER NOT NULL,
+                raw_text    TEXT,
+                UNIQUE(book_id, page_number)
             );
 
             CREATE TABLE IF NOT EXISTS lesson_plans (
@@ -70,6 +83,25 @@ def initialise_db() -> None:
                 created_at  TEXT    NOT NULL
             );
         """)
+    _migrate_db()
+
+
+def _migrate_db() -> None:
+    """Add columns that may be missing from pre-existing installs."""
+    new_chapter_cols = [
+        ("learning_objectives", "TEXT"),
+        ("exercise_types",      "TEXT"),
+        ("key_vocabulary",      "TEXT"),
+        ("topics",              "TEXT"),
+    ]
+    with _get_connection() as conn:
+        for col_name, col_type in new_chapter_cols:
+            try:
+                conn.execute(
+                    f"ALTER TABLE chapters ADD COLUMN {col_name} {col_type}"
+                )
+            except Exception:
+                pass   # column already exists – ignore
 
 
 # ── Books ─────────────────────────────────────────────────────────────────────
@@ -80,8 +112,8 @@ def add_book(title: str, subject: str, year_group: str,
     now = datetime.utcnow().isoformat()
     with _get_connection() as conn:
         cur = conn.execute(
-            """INSERT INTO books (title, subject, year_group, file_path,
-                                  page_count, added_at)
+            """INSERT INTO books
+               (title, subject, year_group, file_path, page_count, added_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (title, subject, year_group, file_path, page_count, now),
         )
@@ -127,13 +159,25 @@ def book_exists(file_path: str) -> bool:
 
 # ── Chapters ──────────────────────────────────────────────────────────────────
 
-def add_chapter(book_id: int, number: int, title: str,
-                start_page: int = None, end_page: int = None) -> int:
+def add_chapter(
+    book_id: int,
+    number:  int,
+    title:   str,
+    start_page:          int  = None,
+    end_page:            int  = None,
+    learning_objectives: str  = "",
+    exercise_types:      str  = "",
+    key_vocabulary:      str  = "",
+    topics:              str  = "",
+) -> int:
     with _get_connection() as conn:
         cur = conn.execute(
-            """INSERT INTO chapters (book_id, number, title, start_page, end_page)
-               VALUES (?, ?, ?, ?, ?)""",
-            (book_id, number, title, start_page, end_page),
+            """INSERT INTO chapters
+               (book_id, number, title, start_page, end_page,
+                learning_objectives, exercise_types, key_vocabulary, topics)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (book_id, number, title, start_page, end_page,
+             learning_objectives, exercise_types, key_vocabulary, topics),
         )
         return cur.lastrowid
 
@@ -145,6 +189,49 @@ def get_chapters(book_id: int) -> list[dict]:
             (book_id,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Pages ─────────────────────────────────────────────────────────────────────
+
+def save_pages(book_id: int, pages: list[dict]) -> None:
+    """Bulk-insert page records.  Each dict: {page_number, raw_text}."""
+    with _get_connection() as conn:
+        conn.executemany(
+            """INSERT OR IGNORE INTO pages (book_id, page_number, raw_text)
+               VALUES (?, ?, ?)""",
+            [(book_id, p["page_number"], p["raw_text"]) for p in pages],
+        )
+
+
+def get_page_text(book_id: int, page_number: int) -> str:
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT raw_text FROM pages WHERE book_id=? AND page_number=?",
+            (book_id, page_number),
+        ).fetchone()
+        return row["raw_text"] if row else ""
+
+
+def get_pages_text_range(book_id: int,
+                         start: int, end: int) -> str:
+    """Return concatenated raw text for pages [start, end] inclusive."""
+    with _get_connection() as conn:
+        rows = conn.execute(
+            """SELECT raw_text FROM pages
+               WHERE book_id=? AND page_number BETWEEN ? AND ?
+               ORDER BY page_number""",
+            (book_id, start, end),
+        ).fetchall()
+        return "\n".join(r["raw_text"] or "" for r in rows)
+
+
+def get_book_page_count_stored(book_id: int) -> int:
+    with _get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM pages WHERE book_id=?",
+            (book_id,),
+        ).fetchone()
+        return row["n"] if row else 0
 
 
 # ── Lesson Plans ──────────────────────────────────────────────────────────────
@@ -169,7 +256,7 @@ def get_lesson_plans(book_id: int = None) -> list[dict]:
     with _get_connection() as conn:
         if book_id:
             rows = conn.execute(
-                "SELECT * FROM lesson_plans WHERE book_id = ? ORDER BY created_at DESC",
+                "SELECT * FROM lesson_plans WHERE book_id=? ORDER BY created_at DESC",
                 (book_id,),
             ).fetchall()
         else:
@@ -186,7 +273,8 @@ def save_worksheet(title: str, content: str,
     now = datetime.utcnow().isoformat()
     with _get_connection() as conn:
         cur = conn.execute(
-            """INSERT INTO worksheets (book_id, title, difficulty, content, created_at)
+            """INSERT INTO worksheets
+               (book_id, title, difficulty, content, created_at)
                VALUES (?, ?, ?, ?, ?)""",
             (book_id, title, difficulty, content, now),
         )
@@ -197,7 +285,7 @@ def get_worksheets(book_id: int = None) -> list[dict]:
     with _get_connection() as conn:
         if book_id:
             rows = conn.execute(
-                "SELECT * FROM worksheets WHERE book_id = ? ORDER BY created_at DESC",
+                "SELECT * FROM worksheets WHERE book_id=? ORDER BY created_at DESC",
                 (book_id,),
             ).fetchall()
         else:
